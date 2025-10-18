@@ -395,11 +395,16 @@ def run_pandoc(title: str, in_html: Path, out_md: Path, assets_dir: Path) -> Non
 def load_robots(url: str, layout: OutputLayout) -> robotparser.RobotFileParser:
     """
     读取 robots.txt 并解析为 RobotFileParser，保证后续抓取遵守站点规则。
-    为保持 curl 一致性，此处仍用 curl 获取文本，再交给 parser.parse。
+    若站点未提供 robots 或返回 404，则在标准输出提示后默认允许抓取，以免中断流程。
     """
-    text = curl_get(url, CURL_HEADERS, layout.cookie_jar)
     parser = robotparser.RobotFileParser()
     parser.set_url(url)
+    try:
+        text = curl_get(url, CURL_HEADERS, layout.cookie_jar)
+    except Exception as exc:
+        print(f"警告：无法读取 robots.txt（{exc}），默认允许抓取。")
+        parser.parse([])
+        return parser
     parser.parse(text.splitlines())
     return parser
 
