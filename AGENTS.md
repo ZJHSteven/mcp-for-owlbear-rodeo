@@ -8,3 +8,4 @@
 - 2025-10-19 Copilot：简化 curl 调用，移除所有 headers/cookies 参数，仅保留 URL。
 - 2025-10-19 Copilot：发现 Cloudflare 保护导致 sitemap 返回质询页面，为 curl 添加 User-Agent 绕过简单检测，并新增 Cloudflare 质询页面检测逻辑。
 - 2025-10-18 Codex Agent：重构 `obr_docs_to_md.py`，同时抓取 apis/reference 目录，修复 308 重定向导致的空文档问题，新增站内链接本地化、目录分层与 url-map 分类标记等清洗流程优化。
+- 2025-10-18 Codex Agent：继续强化 `obr_docs_to_md.py`，新增 Pandoc 后纯文本清洗、站内锚点去装饰、图片资源剔除，以及 `--force-fetch` 参数与缓存复用逻辑，避免重复抓取并保持 Markdown 无 HTML 标签。

@@ -107,6 +107,13 @@ CURL_HEADERS: Dict[str, str] = {
 PANDOC_FROM = "html-native_divs-native_spans"
 PANDOC_TO = "gfm+pipe_tables+raw_html"
 
+# 装饰性元素选择器/路径，专门用于去除对内容理解无帮助的节点。
+DECORATIVE_XPATHS: Sequence[str] = (
+    ".//a[contains(@class, 'hash-link')]",
+    ".//a[@aria-hidden='true']",
+    ".//span[contains(@class, 'hash-link')]",
+    ".//*[@class and contains(@class, 'copyButton')]",
+)
 
 # ────────────────────────────── 数据结构 ──────────────────────────────
 
@@ -455,6 +462,21 @@ def remove_noise(root: html.HtmlElement) -> None:
             node.drop_tree()
 
 
+def remove_decorative_elements(root: html.HtmlElement) -> None:
+    """
+    额外剔除不影响语义、但会在 Markdown 中生成多余 HTML 的装饰节点：
+    - 标题尾部的 hash-link 图标（a.hash-link）
+    - 复制按钮/提示图标（class 包含 copyButton）
+    - 所有 img/svg/picture/figure 等媒体节点，满足“纯文本”要求
+    """
+    for xpath in DECORATIVE_XPATHS:
+        for node in root.xpath(xpath):
+            node.drop_tree()
+
+    for node in root.xpath(".//img | .//picture | .//figure | .//svg"):
+        node.drop_tree()
+
+
 def normalize_links(
     base: str,
     root: html.HtmlElement,
@@ -482,6 +504,12 @@ def normalize_links(
         canonical = canonicalize_url(absolute)
         fragment = f"#{parsed.fragment}" if parsed.fragment else ""
         internal_target = url_to_md.get(canonical)
+        if not internal_target:
+            inferred_category = determine_category_from_url(canonical)
+            if inferred_category:
+                inferred_md = f"{inferred_category}/{slug_from_url(canonical)}.md"
+                url_to_md.setdefault(canonical, inferred_md)
+                internal_target = inferred_md
         if current_md_path and internal_target and not parsed.query:
             target_md_path = md_root / internal_target
             relative = os.path.relpath(target_md_path, start=current_md_path.parent)
@@ -544,6 +572,39 @@ def run_pandoc(title: str, in_html: Path, out_md: Path, assets_dir: Path) -> Non
         raise RuntimeError(f"pandoc 转换失败（退出码 {completed.returncode}）：{stderr or '无额外输出'}")
 
 
+def sanitize_markdown(md_path: Path) -> None:
+    """
+    Pandoc 转出的 Markdown 仍可能残留 HTML 标签或图片引用。
+    该函数二次清洗，确保：
+    - 所有 <img> 标签统统移除；
+    - 内联 <a> 标签被替换为其文本内容，避免 HTML 片段；
+    - 常见装饰性标签（span/div/figure 等）全部删除；
+    - 统一裁剪行尾空格与多余空行，得到整洁可读的纯文本 Markdown。
+    """
+    content = md_path.read_text(encoding="utf-8")
+
+    # 移除所有图片标签。
+    content = re.sub(r"<img[^>]*>", "", content, flags=re.IGNORECASE)
+
+    # 将内联链接替换为纯文本，保留锚点文字，满足“无 HTML 标签”约束。
+    content = re.sub(r"<a[^>]*>(.*?)</a>", r"\1", content, flags=re.IGNORECASE | re.DOTALL)
+
+    # 剥离常见块级标签，避免残留 <div> 等结构。
+    content = re.sub(
+        r"</?(?:span|div|section|article|header|footer|main|figure|figcaption)[^>]*>",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    # 清理多余空白行（连续 ≥3 行空白压缩为 2 行），并移除行尾空格。
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    content = "\n".join(line.rstrip() for line in content.splitlines())
+
+    content = content.strip() + "\n"
+    md_path.write_text(content, encoding="utf-8")
+
+
 def load_robots(url: str, layout: OutputLayout) -> robotparser.RobotFileParser:
     """
     读取 robots.txt 并解析为 RobotFileParser，保证后续抓取遵守站点规则。
@@ -595,6 +656,7 @@ def process_url(
     sleep_min: float,
     sleep_max: float,
     url_to_md: Dict[str, str],
+    force_fetch: bool,
 ) -> Optional[PageResult]:
     """
     针对单个 URL 执行抓取 → 清洗 → 转换 → 记录的完整流程。
@@ -609,19 +671,29 @@ def process_url(
         return None
 
     slug = task.slug
+    category_paths = layout.category_dirs[task.category]
+    raw_path = category_paths.raw_dir / f"{slug}.html"
+    use_cached_raw = (
+        raw_path.exists()
+        and raw_path.stat().st_size > 0
+        and not force_fetch
+    )
+
     attempts = 3
     for attempt in range(1, attempts + 1):
+        fetched_remote = False
         try:
-            html_text = curl_get(url, cookie_jar=layout.cookie_jar, referer=REFERER)
-
-            category_paths = layout.category_dirs[task.category]
-
-            raw_path = category_paths.raw_dir / f"{slug}.html"
-            raw_path.write_text(html_text, encoding="utf-8")
+            if use_cached_raw and attempt == 1:
+                html_text = raw_path.read_text(encoding="utf-8")
+            else:
+                html_text = curl_get(url, cookie_jar=layout.cookie_jar, referer=REFERER)
+                raw_path.write_text(html_text, encoding="utf-8")
+                fetched_remote = True
 
             dom = html.fromstring(html_text)
             main = pick_main(dom)
             remove_noise(main)
+            remove_decorative_elements(main)
             normalize_links(url, main, url, url_to_md, layout.md_dir)
 
             title = extract_title(main, fallback=task.title_guess)
@@ -632,10 +704,12 @@ def process_url(
             md_path = layout.md_dir / md_rel
             md_path.parent.mkdir(parents=True, exist_ok=True)
             run_pandoc(title, cleaned_path, md_path, layout.assets_dir)
+            sanitize_markdown(md_path)
 
+            status = "OK CACHE" if use_cached_raw and attempt == 1 else "OK FETCH"
             append_line(
                 layout.run_log,
-                f"{timestamp()} OK {url} -> {md_path.relative_to(layout.root)}",
+                f"{timestamp()} {status} {url} -> {md_path.relative_to(layout.root)}",
             )
 
             return PageResult(
@@ -648,6 +722,10 @@ def process_url(
                 markdown=md_path,
             )
         except Exception as exc:
+            # 如果缓存解析失败，则后续尝试改为重新抓取。
+            if use_cached_raw:
+                use_cached_raw = False
+
             if attempt < attempts:
                 append_line(
                     layout.run_log,
@@ -666,7 +744,8 @@ def process_url(
             return None
         finally:
             # 每次尝试结束后仍然控制节奏，防止过快触发风控
-            sleep_between(sleep_min, sleep_max)
+            if fetched_remote:
+                sleep_between(sleep_min, sleep_max)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -700,6 +779,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--urls-file",
         help="从文本文件读取待处理 URL 列表（逐行一个），提供后跳过 sitemap。",
+    )
+    parser.add_argument(
+        "--force-fetch",
+        action="store_true",
+        help="忽略本地缓存，强制重新抓取远端 HTML（默认复用已存在原始文件以节省请求）。",
     )
     return parser
 
@@ -812,6 +896,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sleep_min=args.sleep_min,
             sleep_max=args.sleep_max,
             url_to_md=url_to_md,
+            force_fetch=args.force_fetch,
         )
         if result:
             results.append(result)
