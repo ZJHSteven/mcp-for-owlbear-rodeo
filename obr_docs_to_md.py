@@ -38,6 +38,7 @@ CURL_USER_AGENT = "curl/8.7.1"  # 按需求使用 curl/8.x UA，模拟正常命�
 REFERER = "https://docs.owlbear.rodeo/"
 SITEMAP_URL = "https://docs.owlbear.rodeo/sitemap.xml"
 ROBOTS_URL = "https://docs.owlbear.rodeo/robots.txt"
+APIS_INDEX_URL = "https://docs.owlbear.rodeo/extensions/apis/"
 
 # 按官方要求的正文候选选择器顺序排列，命中首个即可。
 MAIN_SELECTORS: Sequence[str] = [
@@ -220,12 +221,14 @@ def curl_get(
     return completed.stdout
 
 
-def collect_api_links_from_sitemap(sitemap_url: str) -> List[Tuple[str, str]]:
+def collect_api_links_from_sitemap(sitemap_url: str, cookie_jar: Optional[Path]) -> List[Tuple[str, str]]:
     """
     从 sitemap.xml 中筛选出 /extensions/apis/ 下的页面列表。
     由于 sitemap 格式稳定，解析比解析导航页更可靠。
     """
-    xml_text = curl_get(sitemap_url, CURL_HEADERS, None)
+    headers = dict(CURL_HEADERS)
+    headers["Accept"] = "application/xml,text/xml;q=0.9,*/*;q=0.8"
+    xml_text = curl_get(sitemap_url, headers, cookie_jar)
     root = etree.fromstring(xml_text.encode("utf-8"))
 
     # sitemap 通常使用默认命名空间：http://www.sitemaps.org/schemas/sitemap/0.9
@@ -248,6 +251,31 @@ def collect_api_links_from_sitemap(sitemap_url: str) -> List[Tuple[str, str]]:
         # 预估标题：将 slug 中的连接符转换为空格后 Title Case，为后续查重提供友好初值。
         guess_title = re.sub(r"[-_]+", " ", slug).title()
         results.append((guess_title, url))
+    return results
+
+
+def collect_api_links_from_index(index_url: str, cookie_jar: Optional[Path]) -> List[Tuple[str, str]]:
+    """
+    Fallback：当 sitemap 被拒绝或暂不可用时，从 API 索引页解析链接。
+    仍然遵守只抓取 /extensions/apis/ 下的文档，避免外溢。
+    """
+    html_text = curl_get(index_url, CURL_HEADERS, cookie_jar)
+    dom = html.fromstring(html_text)
+    results: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+    for anchor in dom.xpath("//a[@href]"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        absolute = urljoin(index_url, href).rstrip("/")
+        if "/extensions/apis/" not in absolute:
+            continue
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        text_fragments = [t.strip() for t in anchor.itertext()]
+        link_title = " ".join(filter(None, text_fragments)).strip() or re.sub(r"[-_]+", " ", slug_from_url(absolute)).title()
+        results.append((link_title, absolute))
     return results
 
 
@@ -407,6 +435,17 @@ def load_robots(url: str, layout: OutputLayout) -> robotparser.RobotFileParser:
         return parser
     parser.parse(text.splitlines())
     return parser
+
+
+def warmup_origin(layout: OutputLayout) -> None:
+    """
+    对主域名进行一次轻量访问，让服务端下发潜在 cookie，提升后续请求的成功率。
+    本操作忽略所有异常，确保不会阻断主流程。
+    """
+    try:
+        curl_get(REFERER, CURL_HEADERS, layout.cookie_jar)
+    except Exception:
+        pass
 
 
 def can_fetch(parser: robotparser.RobotFileParser, url: str) -> bool:
@@ -588,6 +627,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_root = Path(args.out).resolve()
     layout = prepare_layout(out_root)
 
+    warmup_origin(layout)
+
     try:
         robots = load_robots(ROBOTS_URL, layout)
     except Exception as exc:
@@ -600,10 +641,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         targets = load_urls_from_file(Path(args.urls_file))
     else:
         try:
-            targets = collect_api_links_from_sitemap(SITEMAP_URL)
+            targets = collect_api_links_from_sitemap(SITEMAP_URL, layout.cookie_jar)
         except Exception as exc:
-            print(f"错误：解析 sitemap 失败：{exc}", file=sys.stderr)
-            return 1
+            print(f"警告：解析 sitemap 失败（{exc}），尝试改为解析索引页。")
+            try:
+                targets = collect_api_links_from_index(APIS_INDEX_URL, layout.cookie_jar)
+            except Exception as secondary:
+                print(f"错误：解析索引页失败：{secondary}", file=sys.stderr)
+                return 1
 
     if not targets:
         print("未发现需要处理的 URL，任务结束。")
