@@ -648,7 +648,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 targets = collect_api_links_from_index(APIS_INDEX_URL, layout.cookie_jar)
             except Exception as secondary:
                 print(f"错误：解析索引页失败：{secondary}", file=sys.stderr)
-                return 1
+                targets = []
 
     if not targets:
         print("未发现需要处理的 URL，任务结束。")
