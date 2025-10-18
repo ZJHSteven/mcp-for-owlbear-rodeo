@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-教学向脚本：批量把 https://docs.owlbear.rodeo/extensions/apis/ 下的 API 文档页面
+教学向脚本：批量把 https://docs.owlbear.rodeo/extensions/apis/ 与
+https://docs.owlbear.rodeo/extensions/reference/ 下的技术文档页面
 转换为高保真的 GitHub Flavored Markdown（GFM）。
 
 实现要点（呼应需求，便于后续复习）：
@@ -17,16 +18,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
 import urllib.robotparser as robotparser
 
@@ -34,11 +37,36 @@ from lxml import etree, html
 
 # ────────────────────────────── 常量配置 ──────────────────────────────
 
-CURL_USER_AGENT = "curl/8.7.1"  # 按需求使用 curl/8.x UA，模拟正常命令行抓取
-REFERER = "https://docs.owlbear.rodeo/"
-SITEMAP_URL = "https://docs.owlbear.rodeo/sitemap.xml"
-ROBOTS_URL = "https://docs.owlbear.rodeo/robots.txt"
-APIS_INDEX_URL = "https://docs.owlbear.rodeo/extensions/apis/"
+CURL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36"  # 按需求使用 curl/8.x UA，模拟正常命令行抓取
+DOCS_BASE_URL = "https://docs.owlbear.rodeo"
+REFERER = f"{DOCS_BASE_URL}/"
+SITEMAP_URL = f"{DOCS_BASE_URL}/sitemap.xml"
+ROBOTS_URL = f"{DOCS_BASE_URL}/robots.txt"
+
+
+@dataclass(frozen=True)
+class CategoryConfig:
+    """
+    描述一个文档类别的抓取配置（例如 apis/reference），集中保存路径前缀与索引页地址，方便扩展。
+    """
+
+    key: str
+    sitemap_prefix: str
+    index_url: str
+
+
+CATEGORY_CONFIGS: Tuple[CategoryConfig, ...] = (
+    CategoryConfig(
+        key="apis",
+        sitemap_prefix="/extensions/apis/",
+        index_url=f"{DOCS_BASE_URL}/extensions/apis/",
+    ),
+    CategoryConfig(
+        key="reference",
+        sitemap_prefix="/extensions/reference/",
+        index_url=f"{DOCS_BASE_URL}/extensions/reference/",
+    ),
+)
 
 # 按官方要求的正文候选选择器顺序排列，命中首个即可。
 MAIN_SELECTORS: Sequence[str] = [
@@ -82,6 +110,18 @@ PANDOC_TO = "gfm+pipe_tables+raw_html"
 
 # ────────────────────────────── 数据结构 ──────────────────────────────
 
+
+@dataclass
+class CategoryPaths:
+    """
+    为单个类别记录对应的输出子目录，确保不同类别彼此隔离，便于后续检索。
+    """
+
+    raw_dir: Path
+    cleaned_dir: Path
+    md_dir: Path
+
+
 @dataclass
 class OutputLayout:
     """
@@ -98,6 +138,7 @@ class OutputLayout:
     failures_log: Path
     url_map: Path
     cookie_jar: Path
+    category_dirs: Dict[str, CategoryPaths]
 
 
 @dataclass
@@ -107,11 +148,24 @@ class PageResult:
     """
 
     url: str
+    category: str
     title: str
     slug: str
     raw_html: Path
     cleaned_html: Path
     markdown: Path
+
+
+@dataclass
+class TargetTask:
+    """
+    表示等待抓取的单个页面：归属类别 + 预估标题 + 规范化 URL + slug。
+    """
+
+    category: str
+    title_guess: str
+    url: str
+    slug: str
 
 
 # ────────────────────────────── 工具函数 ──────────────────────────────
@@ -126,7 +180,7 @@ def ensure_command_available(cmd_name: str) -> None:
         sys.exit(1)
 
 
-def prepare_layout(out_root: Path) -> OutputLayout:
+def prepare_layout(out_root: Path, categories: Sequence[str]) -> OutputLayout:
     """
     准备输出目录树：out/raw_html、out/cleaned_html、out/md、out/assets、out/logs。
     若目录不存在则创建；若存在则复用，以便增量运行。
@@ -140,6 +194,19 @@ def prepare_layout(out_root: Path) -> OutputLayout:
     for p in (raw_dir, cleaned_dir, md_dir, assets_dir, logs_dir):
         p.mkdir(parents=True, exist_ok=True)
 
+    category_dirs: Dict[str, CategoryPaths] = {}
+    for key in categories:
+        category_raw = raw_dir / key
+        category_cleaned = cleaned_dir / key
+        category_md = md_dir / key
+        for subdir in (category_raw, category_cleaned, category_md):
+            subdir.mkdir(parents=True, exist_ok=True)
+        category_dirs[key] = CategoryPaths(
+            raw_dir=category_raw,
+            cleaned_dir=category_cleaned,
+            md_dir=category_md,
+        )
+
     return OutputLayout(
         root=out_root,
         raw_dir=raw_dir,
@@ -151,6 +218,7 @@ def prepare_layout(out_root: Path) -> OutputLayout:
         failures_log=logs_dir / "failures.txt",
         url_map=out_root / "url-map.json",
         cookie_jar=logs_dir / "curl_cookies.txt",
+        category_dirs=category_dirs,
     )
 
 
@@ -170,38 +238,36 @@ def append_line(path: Path, line: str) -> None:
         handle.write(line + "\n")
 
 
-def curl_get(
-    url: str,
-    headers: Dict[str, str],
-    cookie_jar: Optional[Path],
-    timeout: int = 60,
-) -> str:
+def curl_get(url: str, cookie_jar: Optional[Path] = None, referer: Optional[str] = None) -> str:
     """
     使用 curl 通过子进程抓取页面。
-    关键参数说明：
-    - --compressed：支持 Brotli/Gzip 压缩，节省流量。
-    - --fail：HTTP 40x/50x 会返回非零退出码，便于统一错误处理。
-    - -b/-c：当提供 cookie_jar 时读写同一文件，实现跨请求复用。
+    添加基本的浏览器 User-Agent 来避免 Cloudflare 等 CDN 的简单拦截。
     """
     cmd: List[str] = [
         "curl",
-        "-sS",
-        "-L",
+        "--location",
+        "--silent",
+        "--show-error",
         "--compressed",
-        "--fail",
-        "--max-time",
-        str(timeout),
         "-A",
         CURL_USER_AGENT,
-        "-e",
-        REFERER,
     ]
 
-    if cookie_jar is not None:
-        cmd.extend(["-b", str(cookie_jar), "-c", str(cookie_jar)])
+    for header_name, header_value in CURL_HEADERS.items():
+        cmd.extend(["-H", f"{header_name}: {header_value}"])
 
-    for key, value in headers.items():
-        cmd.extend(["-H", f"{key}: {value}"])
+    if referer:
+        cmd.extend(["-e", referer])
+
+    if cookie_jar:
+        cmd.extend(
+            [
+                "--cookie",
+                str(cookie_jar),
+                "--cookie-jar",
+                str(cookie_jar),
+            ]
+        )
 
     cmd.append(url)
 
@@ -218,85 +284,145 @@ def curl_get(
         stderr = completed.stderr.strip()
         raise RuntimeError(f"curl 报错（退出码 {completed.returncode}）：{stderr or '无额外输出'}")
 
-    return completed.stdout
+    # 检测 Cloudflare 质询页面
+    output = completed.stdout
+    if "Just a moment" in output and "challenge-platform" in output:
+        raise RuntimeError("遇到 Cloudflare 验证页面，curl 无法处理 JavaScript 质询")
+
+    return output
 
 
-def collect_api_links_from_sitemap(sitemap_url: str, cookie_jar: Optional[Path]) -> List[Tuple[str, str]]:
+def canonicalize_url(url: str) -> str:
     """
-    从 sitemap.xml 中筛选出 /extensions/apis/ 下的页面列表。
-    由于 sitemap 格式稳定，解析比解析导航页更可靠。
+    统一 URL 格式：保留协议与域名，移除查询与片段，去除尾部斜杠（根路径除外）。
+    这样可以减少重复键，方便后续映射。
     """
-    headers = dict(CURL_HEADERS)
-    headers["Accept"] = "application/xml,text/xml;q=0.9,*/*;q=0.8"
-    xml_text = curl_get(sitemap_url, headers, cookie_jar)
+    parsed = urlparse(url)
+    scheme = parsed.scheme or urlparse(DOCS_BASE_URL).scheme
+    netloc = parsed.netloc or urlparse(DOCS_BASE_URL).netloc
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return f"{scheme}://{netloc}{path}"
+
+
+def guess_title_from_slug(slug: str) -> str:
+    """
+    将 URL slug 转换为比较可读的标题猜测，便于在日志中定位。
+    """
+    return re.sub(r"[-_]+", " ", slug).strip().title() or slug
+
+
+def determine_category_from_url(url: str) -> Optional[str]:
+    """
+    根据 URL 的路径判断其属于哪个文档类别（apis/reference）。
+    若不匹配任何已知类别，则返回 None。
+    """
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    for config in CATEGORY_CONFIGS:
+        prefix = config.sitemap_prefix.rstrip("/")
+        if path == prefix or path.startswith(f"{prefix}/"):
+            return config.key
+    return None
+
+
+def collect_targets_from_sitemap(sitemap_url: str, cookie_jar: Optional[Path]) -> List[TargetTask]:
+    """
+    从 sitemap.xml 中筛选出已知类别下的文档页面列表。
+    sitemap 结构稳定，优先使用该来源以保证覆盖完整。
+    """
+    xml_text = curl_get(sitemap_url, cookie_jar=cookie_jar, referer=REFERER)
     root = etree.fromstring(xml_text.encode("utf-8"))
 
     # sitemap 通常使用默认命名空间：http://www.sitemaps.org/schemas/sitemap/0.9
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     loc_nodes = root.xpath("//sm:url/sm:loc", namespaces=ns)
 
-    results: List[Tuple[str, str]] = []
+    results: List[TargetTask] = []
     seen: set[str] = set()
     for node in loc_nodes:
         if not isinstance(node, etree._Element) or not node.text:
             continue
-        url = node.text.strip()
-        if "/extensions/apis/" not in url:
+        canonical = canonicalize_url(node.text.strip())
+        category = determine_category_from_url(canonical)
+        if not category:
             continue
-        url = url.rstrip("/")
-        if url in seen:
+        if canonical in seen:
             continue
-        seen.add(url)
-        slug = url.rsplit("/", 1)[-1]
-        # 预估标题：将 slug 中的连接符转换为空格后 Title Case，为后续查重提供友好初值。
-        guess_title = re.sub(r"[-_]+", " ", slug).title()
-        results.append((guess_title, url))
+        seen.add(canonical)
+        slug = slug_from_url(canonical)
+        results.append(
+            TargetTask(
+                category=category,
+                title_guess=guess_title_from_slug(slug),
+                url=canonical,
+                slug=slug,
+            )
+        )
     return results
 
 
-def collect_api_links_from_index(index_url: str, cookie_jar: Optional[Path]) -> List[Tuple[str, str]]:
+def collect_targets_from_index(config: CategoryConfig, cookie_jar: Optional[Path]) -> List[TargetTask]:
     """
-    Fallback：当 sitemap 被拒绝或暂不可用时，从 API 索引页解析链接。
-    仍然遵守只抓取 /extensions/apis/ 下的文档，避免外溢。
+    Fallback：当 sitemap 不可用时，按类别逐个解析索引页中的链接。
+    仅抓取满足该类别路径前缀的 URL，避免误采其他页面。
     """
-    html_text = curl_get(index_url, CURL_HEADERS, cookie_jar)
+    html_text = curl_get(config.index_url, cookie_jar=cookie_jar, referer=REFERER)
     dom = html.fromstring(html_text)
-    results: List[Tuple[str, str]] = []
+    results: List[TargetTask] = []
     seen: set[str] = set()
     for anchor in dom.xpath("//a[@href]"):
         href = anchor.get("href")
         if not href:
             continue
-        absolute = urljoin(index_url, href).rstrip("/")
-        if "/extensions/apis/" not in absolute:
+        absolute = canonicalize_url(urljoin(config.index_url, href))
+        if determine_category_from_url(absolute) != config.key:
             continue
         if absolute in seen:
             continue
         seen.add(absolute)
         text_fragments = [t.strip() for t in anchor.itertext()]
-        link_title = " ".join(filter(None, text_fragments)).strip() or re.sub(r"[-_]+", " ", slug_from_url(absolute)).title()
-        results.append((link_title, absolute))
+        link_title = " ".join(filter(None, text_fragments)).strip() or guess_title_from_slug(slug_from_url(absolute))
+        results.append(
+            TargetTask(
+                category=config.key,
+                title_guess=link_title,
+                url=absolute,
+                slug=slug_from_url(absolute),
+            )
+        )
     return results
 
 
-def load_urls_from_file(path: Path) -> List[Tuple[str, str]]:
+def load_urls_from_file(path: Path) -> List[TargetTask]:
     """
     从文本文件读取 URL 列表，忽略空行与注释（# 开头）。
     返回值包含粗略标题猜测，便于命名。
     """
-    urls: List[Tuple[str, str]] = []
+    urls: List[TargetTask] = []
     seen: set[str] = set()
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        url = line.rstrip("/")
-        if url in seen:
+        canonical = canonicalize_url(line)
+        if canonical in seen:
             continue
-        seen.add(url)
-        slug = url.rsplit("/", 1)[-1]
-        guess_title = re.sub(r"[-_]+", " ", slug).title()
-        urls.append((guess_title, url))
+        category = determine_category_from_url(canonical)
+        if not category:
+            print(f"警告：忽略未知类别的 URL：{canonical}")
+            continue
+        seen.add(canonical)
+        slug = slug_from_url(canonical)
+        urls.append(
+            TargetTask(
+                category=category,
+                title_guess=guess_title_from_slug(slug),
+                url=canonical,
+                slug=slug,
+            )
+        )
     return urls
 
 
@@ -329,14 +455,39 @@ def remove_noise(root: html.HtmlElement) -> None:
             node.drop_tree()
 
 
-def normalize_links(base: str, root: html.HtmlElement) -> None:
+def normalize_links(
+    base: str,
+    root: html.HtmlElement,
+    current_url: str,
+    url_to_md: Dict[str, str],
+    md_root: Path,
+) -> None:
     """
-    将 href/src 等资源链接统一转换为绝对 URL，确保 Markdown 中引用可直接访问。
+    统一正文中的链接与资源：
+    - 站内链接自动映射为相对的本地 Markdown 路径，并保留锚点，方便离线阅读。
+    - 站外链接维持绝对 URL。
+    - 图片链接转换为绝对 URL，方便 pandoc 抽取。
     """
+    current_md_rel = url_to_md.get(current_url)
+    current_md_path = md_root / current_md_rel if current_md_rel else None
+
     for anchor in root.xpath(".//a[@href]"):
         href = anchor.get("href")
-        if href:
-            anchor.set("href", urljoin(base, href))
+        if not href:
+            continue
+        if href.startswith("#"):
+            continue
+        absolute = urljoin(base, href)
+        parsed = urlparse(absolute)
+        canonical = canonicalize_url(absolute)
+        fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+        internal_target = url_to_md.get(canonical)
+        if current_md_path and internal_target and not parsed.query:
+            target_md_path = md_root / internal_target
+            relative = os.path.relpath(target_md_path, start=current_md_path.parent)
+            anchor.set("href", relative.replace("\\", "/") + fragment)
+        else:
+            anchor.set("href", absolute)
     for img in root.xpath(".//img[@src]"):
         src = img.get("src")
         if src:
@@ -357,40 +508,13 @@ def extract_title(main_node: html.HtmlElement, fallback: str) -> str:
     return fallback
 
 
-def file_safe_name(name: str) -> str:
-    """
-    将标题转换为文件系统安全的名称：
-    - 替换非字母数字为下划线
-    - 去掉收尾的下划线，确保不会生成空文件名
-    """
-    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", name).strip("_")
-    return safe or "index"
-
-
-def unique_path(base: Path) -> Path:
-    """
-    若目标路径已存在，则追加数字后缀避免覆盖：
-    例如 foo.md -> foo_1.md -> foo_2.md ...
-    """
-    if not base.exists():
-        return base
-    stem = base.stem
-    suffix = base.suffix
-    counter = 1
-    while True:
-        candidate = base.with_name(f"{stem}_{counter}{suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
-
-
-def save_clean_html(title: str, slug: str, element: html.HtmlElement, layout: OutputLayout) -> Path:
+def save_clean_html(category: str, slug: str, element: html.HtmlElement, layout: OutputLayout) -> Path:
     """
     将清洗后的正文节点序列化为 HTML，保存到 out/cleaned_html/slug.html。
     保留原始 class/属性，以便 Pandoc 按语言标记代码块。
     """
     html_text = html.tostring(element, encoding="unicode", with_tail=False)
-    dest = layout.cleaned_dir / f"{slug}.html"
+    dest = layout.category_dirs[category].cleaned_dir / f"{slug}.html"
     dest.write_text(html_text, encoding="utf-8")
     return dest
 
@@ -428,7 +552,7 @@ def load_robots(url: str, layout: OutputLayout) -> robotparser.RobotFileParser:
     parser = robotparser.RobotFileParser()
     parser.set_url(url)
     try:
-        text = curl_get(url, CURL_HEADERS, layout.cookie_jar)
+        text = curl_get(url, cookie_jar=layout.cookie_jar, referer=REFERER)
     except Exception as exc:
         print(f"警告：无法读取 robots.txt（{exc}），默认允许抓取。")
         parser.parse([])
@@ -443,7 +567,7 @@ def warmup_origin(layout: OutputLayout) -> None:
     本操作忽略所有异常，确保不会阻断主流程。
     """
     try:
-        curl_get(REFERER, CURL_HEADERS, layout.cookie_jar)
+        curl_get(REFERER, cookie_jar=layout.cookie_jar)
     except Exception:
         pass
 
@@ -465,18 +589,18 @@ def sleep_between(min_seconds: float, max_seconds: float) -> None:
 
 
 def process_url(
-    title_guess: str,
-    url: str,
+    task: TargetTask,
     layout: OutputLayout,
-    headers: Dict[str, str],
     robots: robotparser.RobotFileParser,
     sleep_min: float,
     sleep_max: float,
+    url_to_md: Dict[str, str],
 ) -> Optional[PageResult]:
     """
     针对单个 URL 执行抓取 → 清洗 → 转换 → 记录的完整流程。
     内部包含三次重试机制，失败会记录到 failures.txt，然后返回 None。
     """
+    url = task.url
     if not can_fetch(robots, url):
         append_line(
             layout.run_log,
@@ -484,27 +608,29 @@ def process_url(
         )
         return None
 
-    slug = slug_from_url(url)
+    slug = task.slug
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
-            html_text = curl_get(url, headers, layout.cookie_jar)
+            html_text = curl_get(url, cookie_jar=layout.cookie_jar, referer=REFERER)
 
-            raw_path = layout.raw_dir / f"{slug}.html"
+            category_paths = layout.category_dirs[task.category]
+
+            raw_path = category_paths.raw_dir / f"{slug}.html"
             raw_path.write_text(html_text, encoding="utf-8")
 
             dom = html.fromstring(html_text)
             main = pick_main(dom)
             remove_noise(main)
-            normalize_links(url, main)
+            normalize_links(url, main, url, url_to_md, layout.md_dir)
 
-            title = extract_title(main, fallback=title_guess)
-            safe_title = file_safe_name(title)
+            title = extract_title(main, fallback=task.title_guess)
 
-            cleaned_path = save_clean_html(title, slug, main, layout)
+            cleaned_path = save_clean_html(task.category, slug, main, layout)
 
-            md_target = layout.md_dir / f"{safe_title}.md"
-            md_path = unique_path(md_target)
+            md_rel = url_to_md[url]
+            md_path = layout.md_dir / md_rel
+            md_path.parent.mkdir(parents=True, exist_ok=True)
             run_pandoc(title, cleaned_path, md_path, layout.assets_dir)
 
             append_line(
@@ -514,6 +640,7 @@ def process_url(
 
             return PageResult(
                 url=url,
+                category=task.category,
                 title=title,
                 slug=slug,
                 raw_html=raw_path,
@@ -547,11 +674,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     构建命令行参数解析器，提供单页模式、输出目录、速率控制与外部 URL 列表支持。
     """
     parser = argparse.ArgumentParser(
-        description="批量抓取 Owlbear Rodeo 扩展 API 文档并转为 Markdown（教学向实现）。",
+        description="批量抓取 Owlbear Rodeo 扩展文档（apis/reference）并转为 Markdown（教学向实现）。",
     )
     parser.add_argument(
         "--single",
-        help="仅处理单个 API 页面 URL（跳过 sitemap）。",
+        help="仅处理单个扩展文档页面 URL（跳过 sitemap）。",
     )
     parser.add_argument(
         "--out",
@@ -588,11 +715,12 @@ def write_url_map(path: Path, results: List[PageResult], out_root: Path) -> None
         "items": [
             {
                 "url": item.url,
+                "category": item.category,
                 "title": item.title,
                 "slug": item.slug,
-                "raw_html": str(item.raw_html.relative_to(out_root)),
-                "cleaned_html": str(item.cleaned_html.relative_to(out_root)),
-                "markdown": str(item.markdown.relative_to(out_root)),
+                "raw_html": str(item.raw_html.relative_to(out_root)).replace("\\", "/"),
+                "cleaned_html": str(item.cleaned_html.relative_to(out_root)).replace("\\", "/"),
+                "markdown": str(item.markdown.relative_to(out_root)).replace("\\", "/"),
             }
             for item in results
         ],
@@ -608,7 +736,9 @@ def summarize(results: List[PageResult]) -> None:
     if total == 0:
         print("执行完成，但没有成功转换的页面，请查看 logs/failures.txt。")
     else:
-        print(f"成功转换 {total} 个页面，Markdown 位于 {results[0].markdown.parent}")
+        counts = Counter(result.category for result in results)
+        breakdown = ", ".join(f"{category}:{counts[category]}" for category in sorted(counts))
+        print(f"成功转换 {total} 个页面（{breakdown}），Markdown 位于 {results[0].markdown.parent}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -625,7 +755,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ensure_command_available("pandoc")
 
     out_root = Path(args.out).resolve()
-    layout = prepare_layout(out_root)
+    layout = prepare_layout(out_root, [config.key for config in CATEGORY_CONFIGS])
 
     warmup_origin(layout)
 
@@ -636,34 +766,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     if args.single:
-        targets = [(re.sub(r"[-_]+", " ", slug_from_url(args.single)).title(), args.single.rstrip("/"))]
+        canonical = canonicalize_url(args.single)
+        category = determine_category_from_url(canonical)
+        if not category:
+            parser.error("仅支持 /extensions/apis/ 与 /extensions/reference/ 下的页面。")
+        slug = slug_from_url(canonical)
+        targets = [
+            TargetTask(
+                category=category,
+                title_guess=guess_title_from_slug(slug),
+                url=canonical,
+                slug=slug,
+            )
+        ]
     elif args.urls_file:
         targets = load_urls_from_file(Path(args.urls_file))
     else:
         try:
-            targets = collect_api_links_from_sitemap(SITEMAP_URL, layout.cookie_jar)
+            targets = collect_targets_from_sitemap(SITEMAP_URL, layout.cookie_jar)
         except Exception as exc:
-            print(f"警告：解析 sitemap 失败（{exc}），尝试改为解析索引页。")
-            try:
-                targets = collect_api_links_from_index(APIS_INDEX_URL, layout.cookie_jar)
-            except Exception as secondary:
-                print(f"错误：解析索引页失败：{secondary}", file=sys.stderr)
-                targets = []
+            print(f"警告：解析 sitemap 失败（{exc}），尝试改为解析各索引页。")
+            targets = []
+            for config in CATEGORY_CONFIGS:
+                try:
+                    targets.extend(collect_targets_from_index(config, layout.cookie_jar))
+                except Exception as secondary:
+                    print(f"错误：解析 {config.key} 索引页失败：{secondary}", file=sys.stderr)
 
     if not targets:
         print("未发现需要处理的 URL，任务结束。")
         return 0
 
+    # 以 URL 去重，避免 sitemap/索引重复。
+    unique_targets: Dict[str, TargetTask] = {task.url: task for task in targets}
+    targets = sorted(unique_targets.values(), key=lambda item: (item.category, item.slug))
+
+    url_to_md: Dict[str, str] = {task.url: f"{task.category}/{task.slug}.md" for task in targets}
+
     results: List[PageResult] = []
-    for guess_title, url in targets:
+    for task in targets:
         result = process_url(
-            title_guess=guess_title,
-            url=url,
+            task=task,
             layout=layout,
-            headers=CURL_HEADERS,
             robots=robots,
             sleep_min=args.sleep_min,
             sleep_max=args.sleep_max,
+            url_to_md=url_to_md,
         )
         if result:
             results.append(result)
