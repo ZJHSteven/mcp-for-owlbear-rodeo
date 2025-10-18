@@ -27,7 +27,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
@@ -114,6 +114,10 @@ DECORATIVE_XPATHS: Sequence[str] = (
     ".//span[contains(@class, 'hash-link')]",
     ".//*[@class and contains(@class, 'copyButton')]",
 )
+
+# 日志统一使用北京时间（UTC+08:00），便于与操作者所在时区对齐。
+LOCAL_TZ = timezone(timedelta(hours=8))
+LOCAL_TZ_NAME = "UTC+08:00"
 
 # ────────────────────────────── 数据结构 ──────────────────────────────
 
@@ -231,9 +235,9 @@ def prepare_layout(out_root: Path, categories: Sequence[str]) -> OutputLayout:
 
 def timestamp() -> str:
     """
-    返回 ISO8601 UTC 时间戳，用于日志与 url-map，便于审计。
+    返回 ISO8601 北京时间戳（UTC+08:00），用于日志与 url-map，便于审计。
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(LOCAL_TZ).isoformat(timespec="seconds")
 
 
 def append_line(path: Path, line: str) -> None:
@@ -788,14 +792,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def write_url_map(path: Path, results: List[PageResult], out_root: Path) -> None:
+def write_url_map(path: Path, results: List[PageResult], expected: Sequence[TargetTask], out_root: Path) -> None:
     """
     将抓取成果写入 url-map.json，便于后续检索或编排文档。
     内容包括生成时间、输出根路径、每个页面的标题/URL/对应文件。
     """
+    expected_map = {
+        task.url: {
+            "url": task.url,
+            "category": task.category,
+            "slug": task.slug,
+        }
+        for task in expected
+    }
+    success_urls = {item.url for item in results}
+    missing_urls = [url for url in expected_map if url not in success_urls]
+
     data = {
         "generated_at": timestamp(),
+        "timezone": LOCAL_TZ_NAME,
         "output_root": str(out_root),
+        "expected_items": list(expected_map.values()),
         "items": [
             {
                 "url": item.url,
@@ -808,21 +825,31 @@ def write_url_map(path: Path, results: List[PageResult], out_root: Path) -> None
             }
             for item in results
         ],
+        "missing_items": [expected_map[url] for url in missing_urls],
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def summarize(results: List[PageResult]) -> None:
+def summarize(results: List[PageResult], expected: Sequence[TargetTask]) -> None:
     """
     命令行总结，帮助操作者快速了解成功数量与 Markdown 输出位置。
     """
-    total = len(results)
-    if total == 0:
+    total_success = len(results)
+    total_expected = len(expected)
+    missing_urls = [task for task in expected if task.url not in {item.url for item in results}]
+
+    if total_success == 0:
         print("执行完成，但没有成功转换的页面，请查看 logs/failures.txt。")
-    else:
-        counts = Counter(result.category for result in results)
-        breakdown = ", ".join(f"{category}:{counts[category]}" for category in sorted(counts))
-        print(f"成功转换 {total} 个页面（{breakdown}），Markdown 位于 {results[0].markdown.parent}")
+        return
+
+    counts = Counter(result.category for result in results)
+    breakdown = ", ".join(f"{category}:{counts[category]}" for category in sorted(counts))
+    print(f"成功转换 {total_success}/{total_expected} 个页面（{breakdown}），Markdown 位于 {results[0].markdown.parent}")
+
+    if missing_urls:
+        print("仍有以下页面未成功生成 Markdown：")
+        for task in missing_urls:
+            print(f"- [{task.category}] {task.url}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -901,8 +928,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if result:
             results.append(result)
 
-    write_url_map(layout.url_map, results, out_root)
-    summarize(results)
+    write_url_map(layout.url_map, results, targets, out_root)
+    summarize(results, targets)
     return 0
 
 
