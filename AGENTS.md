@@ -10,3 +10,4 @@
 - 2025-10-18 Codex Agent：重构 `obr_docs_to_md.py`，同时抓取 apis/reference 目录，修复 308 重定向导致的空文档问题，新增站内链接本地化、目录分层与 url-map 分类标记等清洗流程优化。
 - 2025-10-18 Codex Agent：继续强化 `obr_docs_to_md.py`，新增 Pandoc 后纯文本清洗、站内锚点去装饰、图片资源剔除，以及 `--force-fetch` 参数与缓存复用逻辑，避免重复抓取并保持 Markdown 无 HTML 标签。
 - 2025-10-19 Codex Agent：补齐 sitemap 完整性校验，将期望列表写入 `url-map.json` 并在终端输出成功/缺失明细，同时统一日志与产物时间为北京时间，便于追踪问题。
+- 2025-10-19 Codex Agent：新增 `README.md`，系统梳理依赖、目录结构、常用命令与自检方式，方便初学者快速上手脚本。
