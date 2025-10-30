@@ -11,3 +11,4 @@
 - 2025-10-18 Codex Agent：继续强化 `obr_docs_to_md.py`，新增 Pandoc 后纯文本清洗、站内锚点去装饰、图片资源剔除，以及 `--force-fetch` 参数与缓存复用逻辑，避免重复抓取并保持 Markdown 无 HTML 标签。
 - 2025-10-19 Codex Agent：补齐 sitemap 完整性校验，将期望列表写入 `url-map.json` 并在终端输出成功/缺失明细，同时统一日志与产物时间为北京时间，便于追踪问题。
 - 2025-10-19 Codex Agent：新增 `README.md`，系统梳理依赖、目录结构、常用命令与自检方式，方便初学者快速上手脚本。
+- 2025-10-30 Codex Agent：应用户请求回退仓库至提交 `2b2ca383c0ff4e3ca4daa6c90fc45920ddbba9e9`，彻底移除后续错误的 MCP TypeScript 重构记录，仅保留 `obr_docs_to_md.py` 与历史说明文档；同步调整 `.gitignore` 忽略 `out/` 与 `docs/`，并将回退前的 `data/`、`docs/`、`legacy/`、`src/` 目录备份至仓库上级的 `_codex_backup_20251030/` 以便后续按需查阅。
