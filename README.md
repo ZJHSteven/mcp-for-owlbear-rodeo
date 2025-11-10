@@ -1,4 +1,46 @@
-# Owlbear Rodeo 扩展文档抓取工具使用说明
+# Owlbear Rodeo 扩展文档工具集
+
+> 现包含两个核心模块：
+> 1. `mcp-docs-server`：基于 uv 发布的 MCP Python 服务端，可直接通过 `uvx mcp-docs-server` 暴露 Owlbear Rodeo 文档资源（搜索 + 打开全文）。
+> 2. `obr_docs_to_md.py`：抓取官网扩展文档、生成 Markdown 的离线脚本，仍用于保持 `docs/markdown` 最新。
+
+## MCP 文档服务器快速上手
+
+1. **安装依赖**
+   ```bash
+   uv sync
+   ```
+2. **查看帮助**
+   ```bash
+   uv run mcp-docs-server --help
+   ```
+3. **最小可运行示例**
+   ```bash
+   uvx mcp-for-owlbear-rodeo mcp-docs-server --transport stdio
+   ```
+   - 默认从 `docs/markdown` 自动加载所有 Markdown 文件，每个文件即一个 MCP 资源 (`doc://owlbear/<category>/<slug>`)。
+   - 自动注册两个工具：
+     - `search_docs(query, top_k=5)`：返回资源链接列表。
+     - `open_doc(name)`：返回完整 Markdown 内容（与资源 URI 对齐）。
+   - 资源描述 (`description`) 直接取自文档首段正文，无人工编写，满足“不要瞎编”约束。
+
+4. **接入自定义文档目录**
+   ```bash
+   uv run mcp-docs-server --docs-path D:/cache/markdown
+   ```
+   或通过环境变量：
+   ```bash
+   set MCP_DOCS_ROOT=D:/cache/markdown
+   uvx mcp-docs-server
+   ```
+
+5. **在其他 MCP 客户端中测试**
+   - 以 Claude MCP Tool 为例，配置 `command`: `"uvx"`, `args`: `["mcp-for-owlbear-rodeo", "mcp-docs-server"]`。
+   - 客户端会自动发现全部 `doc://owlbear/...` 资源，并可调用 `search_docs`/`open_doc`。
+
+> ⚠️默认打包会随 wheel 附带 `docs/markdown`，无需联网即可开箱即用；若要更新内容，请运行下方的抓取脚本刷新 Markdown 再重新构建。
+
+## Owlbear Rodeo 扩展文档抓取工具使用说明
 
 > 脚本入口：`obr_docs_to_md.py`  
 > 目标：批量抓取 https://docs.owlbear.rodeo/extensions/ 下的 API 及 Reference 文档，转换为纯文本 Markdown，方便后续切分与注入 MCP。

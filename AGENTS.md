@@ -12,3 +12,4 @@
 - 2025-10-19 Codex Agent：补齐 sitemap 完整性校验，将期望列表写入 `url-map.json` 并在终端输出成功/缺失明细，同时统一日志与产物时间为北京时间，便于追踪问题。
 - 2025-10-19 Codex Agent：新增 `README.md`，系统梳理依赖、目录结构、常用命令与自检方式，方便初学者快速上手脚本。
 - 2025-10-30 Codex Agent：应用户请求回退仓库至提交 `2b2ca383c0ff4e3ca4daa6c90fc45920ddbba9e9`，彻底移除后续错误的 MCP TypeScript 重构记录，仅保留 `obr_docs_to_md.py` 与历史说明文档；同步调整 `.gitignore` 忽略 `out/` 与 `docs/`，并将回退前的 `data/`、`docs/`、`legacy/`、`src/` 目录备份至仓库上级的 `_codex_backup_20251030/` 以便后续按需查阅。
+- 2025-11-10 Codex Agent：新建 `src/docs_server` Python 包，引入 `DocumentStore`/`SearchIndex`，基于 `mcp[cli]` 实现 `mcp-docs-server`，自动注册 `docs/markdown` 下所有文档为资源并提供 `search_docs` 与 `open_doc` 工具；更新 `pyproject.toml` 以使用 uv/hatch 打包，并在 `README.md` 增补 MCP 快速上手步骤。

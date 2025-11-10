@@ -1,7 +1,33 @@
 [project]
 name = "mcp-for-owlbear-rodeo"
 version = "0.1.0"
-description = "Add your description here"
+description = "Owlbear Rodeo 文档的 MCP 服务端, 支持搜索与资源读取"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+authors = [{ name = "DnD5e Tools" }]
+dependencies = [
+    "mcp[cli]>=1.21.0",
+]
+keywords = ["mcp", "owlbear", "documentation"]
+
+[project.scripts]
+mcp-docs-server = "docs_server:main"
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docs_server"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/docs_server",
+    "docs/markdown",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"docs/markdown" = "docs/markdown"
+
+[tool.hatch.build.targets.sdist.force-include]
+"docs/markdown" = "docs/markdown"
