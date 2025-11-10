@@ -14,3 +14,4 @@
 - 2025-10-30 Codex Agent：应用户请求回退仓库至提交 `2b2ca383c0ff4e3ca4daa6c90fc45920ddbba9e9`，彻底移除后续错误的 MCP TypeScript 重构记录，仅保留 `obr_docs_to_md.py` 与历史说明文档；同步调整 `.gitignore` 忽略 `out/` 与 `docs/`，并将回退前的 `data/`、`docs/`、`legacy/`、`src/` 目录备份至仓库上级的 `_codex_backup_20251030/` 以便后续按需查阅。
 - 2025-11-10 Codex Agent：新建 `src/docs_server` Python 包，引入 `DocumentStore`/`SearchIndex`，基于 `mcp[cli]` 实现 `mcp-docs-server`，自动注册 `docs/markdown` 下所有文档为资源并提供 `search_docs` 与 `open_doc` 工具；更新 `pyproject.toml` 以使用 uv/hatch 打包，并在 `README.md` 增补 MCP 快速上手步骤。
 - 2025-11-10 Codex Agent：清理误提交的 `__pycache__`，在 `.gitignore` 中补充 `.venv/` 与编译缓存忽略，确保仓库保持纯源码交付。
+- 2025-11-10 Codex Agent：适配 `mcp[cli]` 最新 FastMCP API，移除 `input_schema` 旧参数，改用 `Annotated + Field` 自动生成工具入参 Schema，修复 `FastMCP.tool() got an unexpected keyword argument 'input_schema'` 启动错误并提升参数校验可读性。

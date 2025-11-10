@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Annotated, Sequence
+
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.resources import TextResource
@@ -23,6 +25,21 @@ from .exceptions import DocumentNotFoundError
 from .search import SearchIndex, build_search_index
 
 LOGGER = logging.getLogger(__name__)
+
+# ---------------------------- 工具参数 Schema ---------------------------- #
+# 通过 Pydantic Field 在类型提示中声明参数约束, FastMCP 会据此自动生成 JSON Schema。
+QueryArg = Annotated[
+    str,
+    Field(description="搜索关键词, 不能为空, 支持 API 名称或关键术语", min_length=1),
+]
+TopKArg = Annotated[
+    int,
+    Field(description="返回结果条数, 限制在 1-20 之间以控制响应负载", ge=1, le=20),
+]
+DocNameArg = Annotated[
+    str,
+    Field(description="文档唯一名称, 形如 apis/viewport, 由目录+文件名组成", min_length=1),
+]
 
 # ---------------------------- CLI 解析 ---------------------------- #
 
@@ -120,16 +137,9 @@ def _register_tools(server: FastMCP, store: DocumentStore, index: SearchIndex) -
     @server.tool(
         name="search_docs",
         description="按关键词或文档名搜索 Owlbear Rodeo 文档",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "关键词, 例如 viewport/token"},
-                "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
-            },
-            "required": ["query"],
-        },
     )
-    def search_docs(query: str, top_k: int = 5):
+    def search_docs(query: QueryArg, top_k: TopKArg = 5):
+        """搜索匹配文档: 输入关键词与可选的返回数量, 输出 resource_link 列表。"""
         hits = index.search(query, top_k=top_k)
         if not hits:
             return {
@@ -156,18 +166,9 @@ def _register_tools(server: FastMCP, store: DocumentStore, index: SearchIndex) -
     @server.tool(
         name="open_doc",
         description="根据唯一名称读取完整 Markdown 文档",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "文档唯一名称, 例如 apis/viewport",
-                }
-            },
-            "required": ["name"],
-        },
     )
-    def open_doc(name: str):
+    def open_doc(name: DocNameArg):
+        """打开指定文档: 根据唯一名称返回完整 Markdown 内容, 不存在则提示先搜索。"""
         try:
             record = store.get(name)
         except DocumentNotFoundError:
