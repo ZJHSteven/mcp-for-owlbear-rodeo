@@ -103,7 +103,6 @@ def create_server(doc_root: Path | None = None) -> FastMCP:
     server = FastMCP(
         name="docs-server",
         instructions="提供 Owlbear Rodeo 扩展 API 与 Reference 文档查询能力。",
-        dependencies=("docs_server",),
     )
 
     _register_resources(server, store)

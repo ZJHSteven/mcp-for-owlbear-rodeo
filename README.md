@@ -172,3 +172,93 @@ python obr_docs_to_md.py --single https://docs.owlbear.rodeo/extensions/referenc
 - 如需合并 Markdown，可编写额外脚本，根据 `category` 字段聚合生成章节化文档。
 
 > 如果后续需要新增其它目录（例如 `/extensions/tutorials/`），可以参照 `CATEGORY_CONFIGS` 增加配置项并复用现有流程。
+
+
+
+• 整体思路
+                                                                      
+  - 仓库当前只有两个核心模块：MCP 文档服务器 mcp-docs-server 与离线抓 
+    取脚本 obr_docs_to_md.py，可以也应该分别测试，全部流程都能在本地  
+    完成，不需要先发到 PyPI。pyproject.toml 里已声明入口脚本 mcp-docs-    server = "docs_server:main"，因此 uv run mcp-docs-server ... 就   
+    能直接启动最新源码版的服务端，等到发布到 PyPI 后再用 uvx mcp-for- 
+    owlbear-rodeo ... 跑线上版即可（README.md:7-41, pyproject.toml:1- 
+    33）。                                                            
+                                                                      
+  MCP 文档服务器本地验证路径                                          
+                                                                      
+  - 安装依赖：首次或更新后运行 uv sync，uv 会按 pyproject.toml        
+    把 mcp[cli]>=1.21.0 与其余运行时（FastMCP 在依赖里）装好          
+    （README.md:9-16, pyproject.toml:8-10）。                         
+  - 直接跑 CLI：uv run mcp-docs-server --transport stdio --log-level  
+    DEBUG，默认会自动从仓库内的 docs/markdown 扫描文档并注册成资源；  
+    命令行里可观察 “完成资源注册: X 篇文档” 的日志判断加载是否成功    
+    （README.md:17-25, src/docs_server/server.py:1-123）。            
+  - 用 MCP 官方 Inspector 做冒烟测试（不用任何 AI 客户端）：          
+                                                                      
+    uv run mcp dev src/docs_server/server.py:main -- --transport stdio
+  --log-level DEBUG                                                   
+      - 前半段让 mcp dev 启动 Inspector，-- 后的参数原样传进 main()。 
+      - Inspector 打开后：                                            
+          1. Resources → Refresh：确认列表里出现 doc://owlbear/       
+             <category>/<slug>，数量要与 docs/markdown 内文件数一致； 
+             若缺少，回溯日志看哪个 Markdown 无法解析。               
+          2. Tools → search_docs：输入 viewport 等关键词，检查返回的  
+             resource_link 是否能点开。                               
+          3. Tools → open_doc：输入 apis/viewport 等名称，确认能收到整             篇 Markdown。                                            
+  - 与 Codex/Claude/VS Code Copilot 等客户端对接：凡是支持自定        
+    义 MCP 命令的客户端，都只需把命令设置成 uv run mcp-docs-server    
+    --transport stdio 或（若已发版）uvx mcp-for-owlbear-rodeo mcp-    
+    docs-server --transport stdio，客户端就能自动发现 search_docs /   
+    open_doc 两个工具（README.md:17-40）。Codex 这类基于标准 MCP 的代 
+    理只需在其配置里填写同样命令即可，无需额外桥接。                  
+  - 自动化/脚本化自检：可用下述最小脚本确认服务端即将暴露的文档数量、 
+    示例条目是否正确；脚本只读 DocumentStore，不需启动 MCP：          
+                                                                      
+    uv run python - <<'PY'                                            
+    """快速列出可用文档, 方便比对数量"""                              
+    from docs_server.doc_store import DocumentStore                   
+                                                                      
+    store = DocumentStore()                                           
+    docs = store.documents                                            
+    print(f"共加载 {len(docs)} 篇文档, 根目录={store.doc_root}")      
+    for record in docs[:5]:                                           
+    # 逐条示例, 确认类别/URI/简介是否符合预期                         
+        print(f"- {record.name} -> {record.uri}")                     
+    PY                                                                
+    如果脚本抛出 DocumentIndexEmptyError / DocumentNotFoundError（定义    在 src/docs_server/exceptions.py），就说明文档目录不完整或名称输入    错误，可据此定位（src/docs_server/doc_store.py:1-188）。          
+                                                                      
+  VS Code Copilot / 其他编辑器联调建议                                
+                                                                      
+  - 目前 GitHub Copilot MCP 集成仍在逐步放出，若你所在版本尚未开放，可    以先用 mcp dev Inspector 或 Claude Desktop（支持自定义 MCP）验证；    待 Copilot 支持后，沿用同一命令即可，无需改造。调试时可把 --log-  
+    level DEBUG 打开，通过终端日志追踪客户端何时发起 tool call，便于  
+    排查。                                                            
+                                                                      
+  文档抓取脚本测试（确保资源不缺失）                                  
+
+  1. 基础运行：python obr_docs_to_md.py 会抓取官网并在 out/ 生        
+     成 raw_html / cleaned_html / md / logs / url-map.json。若只想    
+     更新仓库随包发出的 Markdown，可跑完后把 out/md/* 覆盖到 docs/    
+     markdown（README.md:43-135）。                                   
+  2. 强制刷新 & 指定 URL：                                            
+      - 网络状态良好但怀疑缓存过期：python obr_docs_to_md.py --force- 
+        fetch。                                                       
+      - 单页调试：python obr_docs_to_md.py --single                   
+        <URL>（README.md:109-143）。                                  
+  3. 验证是否“漏文档”：                                               
+      - 查看 out/url-map.json，missing_items 非空就代表有文档没转成   
+        功，需结合 logs/failures.txt 排查（README.md:64-161）。       
+      - 可配合 rg "<" out/md 确认 Markdown 是否仍混入 HTML，若命中则表        示清洗规则需调整（README.md:155-161）。                       
+  4. 回填到 MCP：当 url-map.json 中 missing_items 为空后，把最新      
+     Markdown 覆盖到 docs/markdown，再按上节步骤重启 mcp-docs-server  
+     验证资源数是否同步增加；DocumentStore 会在日志里打印“使用文档    
+     目录: ...”，可双重确认指向的是你刚更新的目录（src/docs_server/   
+     doc_store.py:70-142）。                                          
+                                                                      
+  “初步手动测试”Checklist（新手友好）                                 
+                                                                      
+  1. uv sync → uv run mcp-docs-server --transport stdio --log-level   
+     DEBUG（服务器能启动，日志里有“完成资源注册”）。                  
+  2. 另开终端跑 uv run mcp dev src/docs_server/server.py:main --      
+     --transport stdio，在 Inspector 里：                             
+      - Resources 显示的数量 = docs/markdown 实际 Markdown 数（可用 rg        --files docs/markdown | wc -l 对比）。                        
+      - search_docs 输入冷门/热门关键词各一次，确保有有/无命中两种情况        都能得到合理文本提示。
